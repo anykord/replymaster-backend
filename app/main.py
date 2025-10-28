@@ -13,8 +13,9 @@ from telethon.sessions import StringSession
 from telethon import TelegramClient
 from telethon.tl.types import PeerUser, PeerChannel, PeerChat
 
+
 # =============================
-# ENVIRONMENT VARIABLES
+# ENV
 # =============================
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
@@ -24,39 +25,50 @@ SESS_DIR.mkdir(exist_ok=True)
 if not API_ID or not API_HASH:
     raise RuntimeError("Please set API_ID and API_HASH in Render → Environment")
 
+
 # =============================
 # STORAGE
 # =============================
-clients: Dict[str, TelegramClient] = {}
-queues: Dict[str, Dict[str, asyncio.Queue]] = {}
-temp_hashes: Dict[str, str] = {}
+clients: Dict[str, TelegramClient] = {}          # accountId -> TelegramClient
+queues: Dict[str, Dict[str, asyncio.Queue]] = {} # accountId -> {peerKey: Queue}
+temp_hashes: Dict[str, str] = {}                 # phone -> phone_code_hash
+
 
 # =============================
-# FASTAPI APP INIT
+# FASTAPI + CORS
 # =============================
+ALLOWED_ORIGINS = [
+    # твой прод фронт
+    "https://replymaster.top",
+    "https://www.replymaster.top",
+    # если используешь кастомный домен Vercel
+    "https://replymaster-frontend.vercel.app",
+    # локальная разработка фронта
+    "http://localhost:3000",
+]
+
 app = FastAPI(title="Replymaster Telegram API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # =============================
 # BASIC ROUTES
 # =============================
-
 @app.get("/")
 async def root():
-    """Root endpoint for uptime checks."""
     return {"ok": True, "service": "replymaster-api"}
 
 @app.get("/health")
 async def health():
-    """Simple health check route."""
     return {"ok": True}
+
 
 # =============================
 # HELPERS
@@ -79,9 +91,11 @@ async def get_or_load_client(account_id: str) -> TelegramClient:
     if account_id in clients:
         await ensure_connected(clients[account_id])
         return clients[account_id]
+
     p = session_path_for(account_id)
     if not p.exists():
         raise HTTPException(status_code=400, detail="Unknown accountId")
+
     session_str = p.read_text().strip()
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     await client.connect()
@@ -117,17 +131,21 @@ async def on_new_message(account_id: str, event: events.NewMessage.Event):
             if q:
                 await q.put(payload)
     except Exception:
+        # не валим обработчик
         pass
+
 
 # =============================
 # TELEGRAM ROUTES
 # =============================
-
 @app.post("/tg/sendCode")
 async def tg_send_code(payload: Dict[str, Any] = Body(...)):
+    """
+    body: { "phone": "+7XXXXXXXXXX" }
+    """
     phone = str(payload.get("phone", "")).strip()
     if not phone:
-        raise HTTPException(400, "phone required")
+        return JSONResponse(status_code=400, content={"error": "phone required"})
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
@@ -135,19 +153,26 @@ async def tg_send_code(payload: Dict[str, Any] = Body(...)):
         r = await client.send_code_request(phone)
         temp_hashes[phone] = r.phone_code_hash
         return {"phone_code_hash": r.phone_code_hash}
+    except Exception as e:
+        # всегда возвращаем JSON (иначе на фронте "Unexpected end of JSON input")
+        return JSONResponse(status_code=400, content={"error": str(e)})
     finally:
         await client.disconnect()
 
+
 @app.post("/tg/signIn")
 async def tg_sign_in(payload: Dict[str, Any] = Body(...)):
+    """
+    body: { "phone": "+7XXXXXXXXXX", "code": "12345" }
+    """
     phone = str(payload.get("phone", "")).strip()
     code = str(payload.get("code", "")).strip()
     if not phone or not code:
-        raise HTTPException(400, "phone & code required")
+        return JSONResponse(status_code=400, content={"error": "phone & code required"})
 
     phone_code_hash = temp_hashes.get(phone)
     if not phone_code_hash:
-        raise HTTPException(400, "phone_code_hash missing/expired; call /tg/sendCode first")
+        return JSONResponse(status_code=400, content={"error": "phone_code_hash missing/expired; call /tg/sendCode first"})
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
@@ -155,25 +180,29 @@ async def tg_sign_in(payload: Dict[str, Any] = Body(...)):
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         session_str = client.session.save()
         acc_id = account_id_from_session(session_str)
+
         session_path_for(acc_id).write_text(session_str)
+
         if acc_id not in clients:
             c2 = TelegramClient(StringSession(session_str), API_ID, API_HASH)
             await c2.connect()
             c2.add_event_handler(lambda e: on_new_message(acc_id, e), events.NewMessage())
             clients[acc_id] = c2
+
         return {"accountId": acc_id}
     except Exception as e:
         if "SESSION_PASSWORD_NEEDED" in str(e):
-            raise HTTPException(403, "Two-factor password required (not implemented)")
-        raise
+            return JSONResponse(status_code=403, content={"error": "Two-factor password required"})
+        return JSONResponse(status_code=400, content={"error": str(e)})
     finally:
         await client.disconnect()
+
 
 @app.post("/tg/me")
 async def tg_me(payload: Dict[str, Any] = Body(...)):
     account_id = str(payload.get("accountId", "")).strip()
     if not account_id:
-        raise HTTPException(400, "accountId required")
+        return JSONResponse(status_code=400, content={"error": "accountId required"})
     client = await get_or_load_client(account_id)
     await ensure_connected(client)
     me = await client.get_me()
@@ -185,12 +214,14 @@ async def tg_me(payload: Dict[str, Any] = Body(...)):
         "last_name": getattr(me, "last_name", None),
     }
 
+
 @app.post("/tg/dialogs")
 async def tg_dialogs(payload: Dict[str, Any] = Body(...)):
     account_id = str(payload.get("accountId", "")).strip()
     limit = int(payload.get("limit", 50))
     if not account_id:
-        raise HTTPException(400, "accountId required")
+        return JSONResponse(status_code=400, content={"error": "accountId required"})
+
     client = await get_or_load_client(account_id)
     await ensure_connected(client)
 
@@ -211,6 +242,7 @@ async def tg_dialogs(payload: Dict[str, Any] = Body(...)):
         })
     return {"dialogs": dialogs}
 
+
 @app.post("/tg/messages")
 async def tg_messages(payload: Dict[str, Any] = Body(...)):
     account_id = str(payload.get("accountId", "")).strip()
@@ -218,14 +250,14 @@ async def tg_messages(payload: Dict[str, Any] = Body(...)):
     limit = int(payload.get("limit", 100))
     limit = max(1, min(500, limit))
     if not account_id or not peer_id:
-        raise HTTPException(400, "accountId & peerId required")
+        return JSONResponse(status_code=400, content={"error": "accountId & peerId required"})
 
     client = await get_or_load_client(account_id)
     await ensure_connected(client)
     try:
         entity = await client.get_entity(int(peer_id))
     except Exception:
-        raise HTTPException(400, "Cannot resolve peerId")
+        return JSONResponse(status_code=400, content={"error": "Cannot resolve peerId"})
 
     msgs = []
     async for m in client.iter_messages(entity, limit=limit):
@@ -246,15 +278,17 @@ async def tg_messages(payload: Dict[str, Any] = Body(...)):
     msgs.sort(key=lambda x: x["id"])
     return {"messages": msgs}
 
+
 @app.get("/tg/subscribe")
 async def tg_subscribe(accountId: str = Query(...), peerId: str = Query(...)):
     account_id = accountId.strip()
     peer_id = peerId.strip()
     if not account_id or not peer_id:
-        raise HTTPException(400, "accountId & peerId required")
+        return JSONResponse(status_code=400, content={"error": "accountId & peerId required"})
 
     client = await get_or_load_client(account_id)
     await ensure_connected(client)
+
     qmap = queues.setdefault(account_id, {})
     q = asyncio.Queue()
     qmap[peer_key(int(peer_id))] = q
