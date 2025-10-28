@@ -17,8 +17,8 @@ from telethon.tl.types import PeerUser, PeerChannel, PeerChat
 # =============================
 # ENV
 # =============================
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
+API_ID = int(os.getenv("API_ID", "0").strip())
+API_HASH = os.getenv("API_HASH", "").strip()
 SESS_DIR = Path("sessions")
 SESS_DIR.mkdir(exist_ok=True)
 
@@ -29,26 +29,22 @@ if not API_ID or not API_HASH:
 # =============================
 # STORAGE
 # =============================
-clients: Dict[str, TelegramClient] = {}          # accountId -> TelegramClient
-queues: Dict[str, Dict[str, asyncio.Queue]] = {} # accountId -> {peerKey: Queue}
-temp_hashes: Dict[str, str] = {}                 # phone -> phone_code_hash
-
+clients: Dict[str, TelegramClient] = {}            # accountId -> TelegramClient
+queues: Dict[str, Dict[str, asyncio.Queue]] = {}   # accountId -> {peerKey: Queue}
+temp_hashes: Dict[str, str] = {}                   # phone -> phone_code_hash
+temp_sessions: Dict[str, str] = {}                 # phone -> StringSession (ВАЖНО!)
 
 # =============================
 # FASTAPI + CORS
 # =============================
 ALLOWED_ORIGINS = [
-    # твой прод фронт
     "https://replymaster.top",
     "https://www.replymaster.top",
-    # если используешь кастомный домен Vercel
     "https://replymaster-frontend.vercel.app",
-    # локальная разработка фронта
     "http://localhost:3000",
 ]
 
 app = FastAPI(title="Replymaster Telegram API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -131,7 +127,6 @@ async def on_new_message(account_id: str, event: events.NewMessage.Event):
             if q:
                 await q.put(payload)
     except Exception:
-        # не валим обработчик
         pass
 
 
@@ -140,21 +135,20 @@ async def on_new_message(account_id: str, event: events.NewMessage.Event):
 # =============================
 @app.post("/tg/sendCode")
 async def tg_send_code(payload: Dict[str, Any] = Body(...)):
-    """
-    body: { "phone": "+7XXXXXXXXXX" }
-    """
+    """body: { "phone": "+7XXXXXXXXXX" }"""
     phone = str(payload.get("phone", "")).strip()
     if not phone:
         return JSONResponse(status_code=400, content={"error": "phone required"})
 
+    # ИСПОЛЬЗУЕМ одну и ту же сессию для sendCode + signIn
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
         r = await client.send_code_request(phone)
         temp_hashes[phone] = r.phone_code_hash
+        temp_sessions[phone] = client.session.save()   # <— сохраняем временную сессию
         return {"phone_code_hash": r.phone_code_hash}
     except Exception as e:
-        # всегда возвращаем JSON (иначе на фронте "Unexpected end of JSON input")
         return JSONResponse(status_code=400, content={"error": str(e)})
     finally:
         await client.disconnect()
@@ -162,37 +156,81 @@ async def tg_send_code(payload: Dict[str, Any] = Body(...)):
 
 @app.post("/tg/signIn")
 async def tg_sign_in(payload: Dict[str, Any] = Body(...)):
-    """
-    body: { "phone": "+7XXXXXXXXXX", "code": "12345" }
-    """
+    """body: { "phone": "+7...", "code": "12345" }"""
     phone = str(payload.get("phone", "")).strip()
     code = str(payload.get("code", "")).strip()
     if not phone or not code:
         return JSONResponse(status_code=400, content={"error": "phone & code required"})
 
     phone_code_hash = temp_hashes.get(phone)
-    if not phone_code_hash:
-        return JSONResponse(status_code=400, content={"error": "phone_code_hash missing/expired; call /tg/sendCode first"})
+    session_str = temp_sessions.get(phone)
+    if not phone_code_hash or not session_str:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "sendCode session missing/expired; call /tg/sendCode again"}
+        )
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    # ПОДКЛЮЧАЕМСЯ ТЕМ ЖЕ СЕАНСОМ, ЧТО И ПРИ sendCode
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     await client.connect()
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-        session_str = client.session.save()
-        acc_id = account_id_from_session(session_str)
+        session_str_final = client.session.save()
+        acc_id = account_id_from_session(session_str_final)
 
-        session_path_for(acc_id).write_text(session_str)
+        session_path_for(acc_id).write_text(session_str_final)
 
         if acc_id not in clients:
-            c2 = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+            c2 = TelegramClient(StringSession(session_str_final), API_ID, API_HASH)
             await c2.connect()
             c2.add_event_handler(lambda e: on_new_message(acc_id, e), events.NewMessage())
             clients[acc_id] = c2
+
+        # очищаем временные данные
+        temp_hashes.pop(phone, None)
+        temp_sessions.pop(phone, None)
 
         return {"accountId": acc_id}
     except Exception as e:
         if "SESSION_PASSWORD_NEEDED" in str(e):
             return JSONResponse(status_code=403, content={"error": "Two-factor password required"})
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    finally:
+        await client.disconnect()
+
+
+@app.post("/tg/signInPassword")
+async def tg_sign_in_password(payload: Dict[str, Any] = Body(...)):
+    """body: { "phone": "+7...", "password": "2FA" }"""
+    phone = str(payload.get("phone", "")).strip()
+    password = str(payload.get("password", "")).strip()
+    if not phone or not password:
+        return JSONResponse(status_code=400, content={"error": "phone & password required"})
+
+    # используем ту же временную сессию
+    session_str = temp_sessions.get(phone)
+    if not session_str:
+        return JSONResponse(status_code=400, content={"error": "sendCode session missing; call /tg/sendCode"})
+
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    await client.connect()
+    try:
+        await client.sign_in(password=password)
+        session_str_final = client.session.save()
+        acc_id = account_id_from_session(session_str_final)
+        session_path_for(acc_id).write_text(session_str_final)
+
+        if acc_id not in clients:
+            c2 = TelegramClient(StringSession(session_str_final), API_ID, API_HASH)
+            await c2.connect()
+            c2.add_event_handler(lambda e: on_new_message(acc_id, e), events.NewMessage())
+            clients[acc_id] = c2
+
+        temp_hashes.pop(phone, None)
+        temp_sessions.pop(phone, None)
+
+        return {"accountId": acc_id}
+    except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     finally:
         await client.disconnect()
